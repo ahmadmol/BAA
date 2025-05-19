@@ -1,23 +1,44 @@
+from flask import Flask, request, jsonify # type: ignore
 from ultralytics import YOLO
 import cv2
-import multiprocessing
+import numpy as np
+import os
+
+app = Flask(__name__)
+
+model = YOLO("yolov8n.pt")  # تحميل النموذج
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image provided'}), 400
+    
+    file = request.files['image']
+    img_bytes = file.read()
+
+    # تحويل البايت إلى صورة OpenCV
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return jsonify({'error': 'Invalid image'}), 400
+
+    results = model(img)
+
+    detections = []
+    for r in results:
+        for box in r.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            conf = float(box.conf[0])
+            cls = int(box.cls[0])
+            label = model.names[cls]
+            detections.append({
+                'label': label,
+                'confidence': conf,
+                'bbox': [x1, y1, x2, y2],
+            })
+
+    return jsonify({'detections': detections})
 
 if __name__ == '__main__':
-    multiprocessing.freeze_support()
-
-    # تحميل النموذج المدرب (بعد التدريب)
-    model = YOLO("yolov8n.pt")  # أو "yolov8n.pt" لو أردت النموذج الجاهز
-
-    # تحديد مسار الصورة
-    # image_path = "C:/Users/WIN 10/Desktop/test1.jpg"
-    image="C:\Users\WIN 10\Desktop\BAA\test1"
-    # تنفيذ التنبؤ مع عرض الصورة وحفظها
-    results = model(image, show=True)
-     
-    # for r in results:
-    #     annotated_img = r.plot()
-
-    #     # تحديد مسار الحفظ
-    #     save_path = "C:/Users/WIN 10/Desktop/BAA/result.jpg"
-    #     cv2.imwrite(save_path, annotated_img)
-    #     print(f"تم حفظ الصورة في: {save_path}")
+    app.run(host='0.0.0.0', port=5000)
