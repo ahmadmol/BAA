@@ -1,326 +1,223 @@
-import 'package:flutter/material.dart';
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:camera/camera.dart';
-import 'package:local_auth/local_auth.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:path/path.dart' show join;
-import 'package:http/http.dart' as http;
-import 'package:flutter/widgets.dart';
+import 'package:flutter/material.dart' hide Image;
+import 'package:image/image.dart' as imglib;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const MyApp());
+  final cameras = await availableCameras();
+  runApp(Main(cameras: cameras));
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class Main extends StatelessWidget {
+  final List<CameraDescription> cameras;
+
+  const Main({super.key, required this.cameras});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      navigatorObservers: [CameraNavigatorObserver()],
-      home: const AuthGate(),
+      home: CameraStreamPage(cameras: cameras),
     );
   }
 }
 
-class CameraNavigatorObserver extends NavigatorObserver {
-  @override
-  void didPop(Route route, Route? previousRoute) {
-    if (previousRoute?.settings.name == '/camera') {
-      final cameraState = route.navigator?.context.findAncestorStateOfType<_CameraScreenState>();
-      cameraState?._disposeCamera();
-    }
-  }
-}
+class CameraStreamPage extends StatefulWidget {
+  final List<CameraDescription> cameras;
 
-class AuthGate extends StatefulWidget {
-  const AuthGate({super.key});
+  const CameraStreamPage({super.key, required this.cameras});
 
   @override
-  State<AuthGate> createState() => _AuthGateState();
+  _CameraStreamPageState createState() => _CameraStreamPageState();
 }
 
-class _AuthGateState extends State<AuthGate> {
-  final LocalAuthentication auth = LocalAuthentication();
-  bool _loading = true;
-  bool _failed = false;
+class _CameraStreamPageState extends State<CameraStreamPage> {
+  late CameraController _controller;
+  CameraImage? _latestImage;
+  Timer? _timer;
+  String _resultText = '';
 
   @override
   void initState() {
     super.initState();
-    _checkAuthentication();
-  }
+    _controller = CameraController(
+      widget.cameras[0],
+      ResolutionPreset.medium,
+      imageFormatGroup: ImageFormatGroup.yuv420,
+    );
 
-  Future<void> _checkAuthentication() async {
-    final prefs = await SharedPreferences.getInstance();
-    bool? isAuthenticated = prefs.getBool('isAuthenticated');
-
-    if (isAuthenticated == true) {
-      _goToCamera();
-    } else {
-      await _authenticateUser();
-    }
-
-    setState(() => _loading = false);
-  }
-
-  Future<void> _authenticateUser() async {
-    try {
-      bool didAuthenticate = await auth.authenticate(
-        localizedReason: 'يرجى استخدام بصمتك للدخول لأول مرة',
-        options: const AuthenticationOptions(biometricOnly: true),
-      );
-
-      if (didAuthenticate) {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setBool('isAuthenticated', true);
-        _goToCamera();
-      } else {
-        setState(() => _failed = true);
-      }
-    } catch (e) {
-      print("❌ خطأ في التحقق بالبصمة: $e");
-      setState(() => _failed = true);
-    }
-  }
-
-  void _goToCamera() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(
-          builder: (_) => const CameraScreen(),
-          settings: const RouteSettings(name: '/camera'),
-        ),
-      );
+    _controller.initialize().then((_) {
+      if (!mounted) return;
+      setState(() {});
+      _startStreaming();
     });
   }
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Center(
-        child: _loading
-            ? const CircularProgressIndicator()
-            : _failed
-            ? Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Text('فشل التحقق بالبصمة'),
-            const SizedBox(height: 16),
-            ElevatedButton(
-              onPressed: _authenticateUser,
-              child: const Text('أعد المحاولة'),
-            ),
-          ],
-        )
-            : const Text('جارٍ التحميل...'),
-      ),
-    );
-  }
-}
-
-class CameraScreen extends StatefulWidget {
-  const CameraScreen({super.key});
-
-  @override
-  State<CameraScreen> createState() => _CameraScreenState();
-}
-
-class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver {
-  CameraController? _controller;
-  late List<CameraDescription> cameras;
-  bool _isInitialized = false;
-  String? _savedImagePath;
-  String? _serverResponse;
-  bool _isProcessing = false;
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    _initCamera();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused) {
-      _disposeCamera();
-    } else if (state == AppLifecycleState.resumed && !_isInitialized) {
-      _initCamera();
-    }
-  }
-
-  Future<void> _initCamera() async {
-    try {
-      cameras = await availableCameras();
-      _controller = CameraController(cameras[0], ResolutionPreset.medium);
-      await _controller!.initialize();
-      if (!mounted) return;
-
-      setState(() => _isInitialized = true);
-
-      await Future.delayed(const Duration(milliseconds: 500));
-      await _takePicture();
-    } catch (e) {
-      print("❌ فشل في تهيئة الكاميرا: $e");
-    }
-  }
-
-  void _disposeCamera() {
-    if (_controller != null) {
-      _controller!.dispose();
-      _controller = null;
-      setState(() => _isInitialized = false);
-    }
-  }
-
-  Future<void> _takePicture() async {
-    if (!_isInitialized || _isProcessing || _controller == null || !_controller!.value.isInitialized) return;
-
-    setState(() => _isProcessing = true);
-
-    try {
-      final image = await _controller!.takePicture();
-
-      final Directory dir = await getApplicationDocumentsDirectory();
-      final String newPath = join(
-        dir.path,
-        'captured_${DateTime.now().millisecondsSinceEpoch}.jpg',
-      );
-      final File newImage = await File(image.path).copy(newPath);
-
-      setState(() {
-        _savedImagePath = newImage.path;
-        _serverResponse = null;
-      });
-
-      print("✅ الصورة تم حفظها في: $_savedImagePath");
-      await sendImageToServer(_savedImagePath!);
-    } catch (e) {
-      print("❌ فشل في التقاط الصورة: $e");
-    } finally {
-      if (mounted) {
-        setState(() => _isProcessing = false);
-      }
-    }
-  }
-
-  Future<void> sendImageToServer(String imagePath) async {
-    final uri = Uri.parse('http://YOUR_PYTHON_SERVER_IP:5000/predict');
-    final request = http.MultipartRequest('POST', uri);
-
-    try {
-      request.files.add(await http.MultipartFile.fromPath('image', imagePath));
-      final response = await request.send();
-
-      if (response.statusCode == 200) {
-        final respStr = await response.stream.bytesToString();
-        print('Response from server: $respStr');
-        setState(() {
-          _serverResponse = respStr;
-        });
-      } else {
-        print('Failed to get response from server: ${response.statusCode}');
-        setState(() {
-          _serverResponse = 'Failed: ${response.statusCode}';
-        });
-      }
-    } catch (e) {
-      print('Error sending image: $e');
-      setState(() {
-        _serverResponse = 'Error: $e';
-      });
-    }
-  }
-
-  @override
   void dispose() {
-    _disposeCamera();
-    WidgetsBinding.instance.removeObserver(this);
+    _timer?.cancel();
+    _controller.dispose();
     super.dispose();
   }
 
+  void _startStreaming() {
+    _controller.startImageStream((CameraImage image) {
+      _latestImage = image;
+    });
+
+    _timer = Timer.periodic(const Duration(milliseconds: 300), (timer) async {
+      if (_latestImage == null) return;
+
+      try {
+        final imglib.Image rawImage = Converter.convertCameraImage(_latestImage!);
+        final imglib.Image resizedImage = imglib.copyResize(rawImage, width: 300);
+
+        final Uint8List jpgBytes = Uint8List.fromList(
+          imglib.encodeJpg(resizedImage, quality: 50),
+        );
+
+        await sendImageData(jpgBytes);
+      } catch (e) {
+        print("Error processing/sending image: $e");
+      }
+
+      _latestImage = null;
+    });
+  }
+
+  Future<void> sendImageData(Uint8List data) async {
+    Socket? socket;
+    try {
+      socket = await Socket.connect('192.168.0.172', 50000);
+      socket.add(utf8.encode('${data.length}\n'));
+      socket.add(data);
+      await socket.flush();
+
+      final response = await socket
+          .transform(utf8.decoder as StreamTransformer<Uint8List, dynamic>)
+          .transform(const LineSplitter())
+          .first;
+
+      if (mounted) {
+        setState(() {
+          _resultText = response;
+        });
+      }
+    } catch (e) {
+      print('Socket connection error: $e');
+    } finally {
+      await socket?.close();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    if (!_isInitialized) {
+    if (!_controller.value.isInitialized) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('مساعد المكفوفين'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.camera_alt),
-            onPressed: _isProcessing ? null : _takePicture,
+        title: Align(
+          alignment: Alignment.centerRight,
+          child: const Text(
+            "مساعد ذكي للمكفوفين",
+            style: TextStyle(color: Colors.white),
           ),
-        ],
+        ),
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
       ),
       body: Column(
         children: [
-          Expanded(
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                CameraPreview(_controller!),
-                if (_isProcessing)
-                  const CircularProgressIndicator(),
-              ],
-            ),
-          ),
-          if (_savedImagePath != null) ...[
-            Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: Image.file(
-                File(_savedImagePath!),
-                width: 200,
-                height: 150,
-                fit: BoxFit.cover,
-              ),
-            ),
-          ],
-          if (_serverResponse != null) ...[
-            Container(
-              padding: const EdgeInsets.all(12),
-              margin: const EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                color: Colors.grey[200],
-                borderRadius: BorderRadius.circular(8),
-              ),
+          Expanded(child: CameraPreview(_controller)),
+          Container(
+            width: double.infinity,
+            height: 400,
+            color: Colors.black,
+            padding: const EdgeInsets.all(16),
+            child: SingleChildScrollView(
               child: Text(
-                _serverResponse!,
-                style: const TextStyle(fontSize: 14),
+                _resultText,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w500,
+                ),
+                textAlign: TextAlign.center,
               ),
-            ),
-          ],
-          Padding(
-            padding: const EdgeInsets.all(8.0),
-            child: ElevatedButton(
-              onPressed: _isProcessing ? null : _takePicture,
-              child: _isProcessing
-                  ? const Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.white,
-                    ),
-                  ),
-                  SizedBox(width: 8),
-                  Text('جاري المعالجة...'),
-                ],
-              )
-                  : const Text('التقاط صورة جديدة'),
             ),
           ),
         ],
       ),
     );
+  }
+}
+
+class Converter {
+  static imglib.Image convertCameraImage(CameraImage cameraImage) {
+    if (cameraImage.format.group == ImageFormatGroup.yuv420) {
+      return convertYUV420ToImage(cameraImage);
+    } else if (cameraImage.format.group == ImageFormatGroup.bgra8888) {
+      return convertBGRA8888ToImage(cameraImage);
+    } else {
+      throw Exception('Unsupported image format: ${cameraImage.format.group}');
+    }
+  }
+
+  static imglib.Image convertBGRA8888ToImage(CameraImage cameraImage) {
+    return imglib.Image.fromBytes(
+      width: cameraImage.planes[0].width!,
+      height: cameraImage.planes[0].height!,
+      bytes: cameraImage.planes[0].bytes.buffer,
+      order: imglib.ChannelOrder.bgra,
+    );
+  }
+
+  static imglib.Image convertYUV420ToImage(CameraImage cameraImage) {
+    final int width = cameraImage.width;
+    final int height = cameraImage.height;
+
+    final imglib.Image img = imglib.Image(width: width, height: height);
+    final Uint8List yPlane = cameraImage.planes[0].bytes;
+    final Uint8List uPlane = cameraImage.planes[1].bytes;
+    final Uint8List vPlane = cameraImage.planes[2].bytes;
+
+    final int yRowStride = cameraImage.planes[0].bytesPerRow;
+    final int yPixelStride = cameraImage.planes[0].bytesPerPixel!;
+
+    final int uvRowStride = cameraImage.planes[1].bytesPerRow;
+    final int uvPixelStride = cameraImage.planes[1].bytesPerPixel!;
+
+    for (int h = 0; h < height; h++) {
+      final int uvRow = h >> 1;
+      for (int w = 0; w < width; w++) {
+        final int uvCol = w >> 1;
+
+        final int yIndex = h * yRowStride + w * yPixelStride;
+        final int uvIndex = uvRow * uvRowStride + uvCol * uvPixelStride;
+
+        final int y = yPlane[yIndex];
+        final int u = uPlane[uvIndex];
+        final int v = vPlane[uvIndex];
+
+        int r = (y + (v * 1436 / 1024) - 179).round();
+        int g = (y - (u * 46549 / 131072) + 44 - (v * 93604 / 131072) + 91).round();
+        int b = (y + (u * 1814 / 1024) - 227).round();
+
+        r = r.clamp(0, 255);
+        g = g.clamp(0, 255);
+        b = b.clamp(0, 255);
+
+        img.setPixelRgb(w, h, r, g, b);
+      }
+    }
+
+    return img;
   }
 }
