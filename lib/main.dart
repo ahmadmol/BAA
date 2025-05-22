@@ -70,7 +70,7 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
       _latestImage = image;
     });
 
-    _timer = Timer.periodic(const Duration(milliseconds: 300), (timer) async {
+    _timer = Timer.periodic(const Duration(milliseconds: 1000), (timer) async {
       if (_latestImage == null) return;
 
       try {
@@ -82,6 +82,7 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
         );
 
         await sendImageData(jpgBytes);
+
       } catch (e) {
         print("Error processing/sending image: $e");
       }
@@ -93,7 +94,8 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
   Future<void> sendImageData(Uint8List data) async {
     Socket? socket;
     try {
-      socket = await Socket.connect('192.168.0.172', 50000);
+      socket = await Socket.connect('192.168.171.38', 50001);
+      print("✅ Connected! Sending length...");
       socket.add(utf8.encode('${data.length}\n'));
       socket.add(data);
       await socket.flush();
@@ -113,6 +115,8 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
     } finally {
       await socket?.close();
     }
+    print("📤 Sending image of size: ${data.length} bytes");
+
   }
 
   @override
