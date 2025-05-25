@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
+import 'package:http_parser/http_parser.dart';
 import 'dart:typed_data';
-
 import 'package:camera/camera.dart';
+import 'package:animate_do/animate_do.dart';
 import 'package:flutter/material.dart' hide Image;
 import 'package:image/image.dart' as imglib;
+import 'package:http/http.dart' as http;
+import 'package:animate_do/animate_do.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -40,14 +42,14 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
   late CameraController _controller;
   CameraImage? _latestImage;
   Timer? _timer;
-  String _resultText = '';
+  List<String> _detectedObjects = [];
 
   @override
   void initState() {
     super.initState();
     _controller = CameraController(
       widget.cameras[0],
-      ResolutionPreset.medium,
+      ResolutionPreset.high,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
 
@@ -70,7 +72,7 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
       _latestImage = image;
     });
 
-    _timer = Timer.periodic(const Duration(milliseconds: 1000), (timer) async {
+    _timer = Timer.periodic(const Duration(seconds: 5), (timer) async {
       if (_latestImage == null) return;
 
       try {
@@ -78,11 +80,10 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
         final imglib.Image resizedImage = imglib.copyResize(rawImage, width: 300);
 
         final Uint8List jpgBytes = Uint8List.fromList(
-          imglib.encodeJpg(resizedImage, quality: 50),
+          imglib.encodeJpg(resizedImage, quality: 25),
         );
 
         await sendImageData(jpgBytes);
-
       } catch (e) {
         print("Error processing/sending image: $e");
       }
@@ -92,31 +93,60 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
   }
 
   Future<void> sendImageData(Uint8List data) async {
-    Socket? socket;
     try {
-      socket = await Socket.connect('192.168.171.38', 50001);
-      print("✅ Connected! Sending length...");
-      socket.add(utf8.encode('${data.length}\n'));
-      socket.add(data);
-      await socket.flush();
+      final uri = Uri.parse('http://192.168.1.2:50001/upload');
+      final request = http.MultipartRequest('POST', uri)
+        ..files.add(http.MultipartFile.fromBytes(
+          'image',
+          data,
+          filename: 'image.jpg',
+          contentType: MediaType('image', 'jpeg'),
+        ));
 
-      final response = await socket
-          .transform(utf8.decoder as StreamTransformer<Uint8List, dynamic>)
-          .transform(const LineSplitter())
-          .first;
+      final response = await request.send();
 
-      if (mounted) {
-        setState(() {
-          _resultText = response;
-        });
+      if (response.statusCode == 200) {
+        final responseBody = await response.stream.bytesToString();
+        if (mounted) {
+          setState(() {
+            _detectedObjects = responseBody.split(', ').where((e) => e.isNotEmpty).toList();
+          });
+        }
+      } else {
+        print('HTTP Error: ${response.statusCode}');
       }
     } catch (e) {
-      print('Socket connection error: $e');
-    } finally {
-      await socket?.close();
+      print('HTTP connection error: $e');
     }
-    print("📤 Sending image of size: ${data.length} bytes");
 
+    print("📤 Sent image of size: ${data.length} bytes via HTTP");
+  }
+
+  Widget _buildObjectItem(String label) {
+    final Map<String, IconData> icons = {
+      'person': Icons.person,
+      'car': Icons.directions_car,
+      'dog': Icons.pets,
+      'cat': Icons.pets,
+      'chair': Icons.chair,
+      'tv': Icons.tv,
+    };
+    final icon = icons[label.toLowerCase()] ?? Icons.help;
+
+    return FadeInUp(
+      child: Card(
+        color: Colors.grey[900],
+        margin: const EdgeInsets.symmetric(vertical: 8),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: ListTile(
+          leading: Icon(icon, color: Colors.white, size: 32),
+          title: Text(
+            label,
+            style: const TextStyle(color: Colors.white, fontSize: 20),
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -124,15 +154,11 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
     if (!_controller.value.isInitialized) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
-
     return Scaffold(
       appBar: AppBar(
-        title: Align(
+        title: const Align(
           alignment: Alignment.centerRight,
-          child: const Text(
-            "مساعد ذكي للمكفوفين",
-            style: TextStyle(color: Colors.white),
-          ),
+          child: Text("مساعد ذكي للمكفوفين", style: TextStyle(color: Colors.white)),
         ),
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
@@ -145,16 +171,15 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
             height: 400,
             color: Colors.black,
             padding: const EdgeInsets.all(16),
-            child: SingleChildScrollView(
+            child: _detectedObjects.isEmpty
+                ? const Center(
               child: Text(
-                _resultText,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w500,
-                ),
-                textAlign: TextAlign.center,
+                "لا يوجد كائنات معروفة",
+                style: TextStyle(color: Colors.white, fontSize: 18),
               ),
+            )
+                : ListView(
+              children: _detectedObjects.map((obj) => _buildObjectItem(obj)).toList(),
             ),
           ),
         ],
