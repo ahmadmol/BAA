@@ -67,11 +67,16 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
   }
 
   @override
-  Future<void> initState() async {
+  void initState() {
     super.initState();
-    _initCamera();
+    _initializeAsyncTasks(); // دالة جديدة تقوم بالمهام غير المتزامنة
+  }
+
+  Future<void> _initializeAsyncTasks() async {
+    await _initCamera();
     await Permission.storage.request();
   }
+
 
   Future<void> _initCamera() async {
     _controller = CameraController(
