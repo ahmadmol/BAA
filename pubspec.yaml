@@ -12,7 +12,8 @@ dependencies:
     sdk: flutter
   local_auth: ^2.1.7
   shared_preferences: ^2.2.2
-  path_provider: ^2.1.2
+  path_provider: ^2.0.15
+  permission_handler: ^11.3.0
   camera: ^0.11.1  # ✅ إضافة مكتبة الكاميرا
   http: ^1.4.0
   animated_text_kit: ^4.2.2

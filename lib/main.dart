@@ -1,13 +1,13 @@
 import 'dart:async';
-import 'dart:convert';
-import 'package:http_parser/http_parser.dart';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
-import 'package:animate_do/animate_do.dart';
 import 'package:flutter/material.dart' hide Image;
 import 'package:image/image.dart' as imglib;
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'dart:io';
 import 'package:http/http.dart' as http;
-import 'package:animate_do/animate_do.dart';
+import 'package:http_parser/http_parser.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -43,21 +43,59 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
   CameraImage? _latestImage;
   Timer? _timer;
   List<String> _detectedObjects = [];
+  late Directory _resultsDirectory;
+  IconData _getIcon(String label) {
+    final icons = {
+      'person': Icons.person,
+      'car': Icons.directions_car,
+      'dog': Icons.pets,
+      'cat': Icons.pets,
+      'chair': Icons.chair,
+      'tv': Icons.tv,
+    };
+    return icons[label.toLowerCase()] ?? Icons.help_outline;
+  }
+  Future<void> saveToGallery(Uint8List bytes, int count) async {
+    final String folderPath = "/storage/emulated/0/DCIM/DetectedImages";
+    final dir = Directory(folderPath);
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    final File file = File('$folderPath/image_$count.jpg');
+    await file.writeAsBytes(bytes);
+    print("✅ تم حفظ الصورة في معرض الصور: ${file.path}");
+  }
 
   @override
-  void initState() {
+  Future<void> initState() async {
     super.initState();
+    _initCamera();
+    await Permission.storage.request();
+  }
+
+  Future<void> _initCamera() async {
     _controller = CameraController(
       widget.cameras[0],
-      ResolutionPreset.high,
+      ResolutionPreset.max, // استخدام أعلى دقة
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
 
-    _controller.initialize().then((_) {
-      if (!mounted) return;
-      setState(() {});
-      _startStreaming();
-    });
+    await _controller.initialize();
+
+    if (!mounted) return;
+
+    setState(() {});
+
+    // إنشاء مجلد results في الذاكرة الداخلية
+    final Directory appDir = await getApplicationDocumentsDirectory();
+    _resultsDirectory = Directory('${appDir.path}/results');
+
+    if (!await _resultsDirectory.exists()) {
+      await _resultsDirectory.create(recursive: true);
+      print("✅ تم إنشاء مجلد النتائج: ${_resultsDirectory.path}");
+    }
+
+    _startStreaming();
   }
 
   @override
@@ -72,16 +110,28 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
       _latestImage = image;
     });
 
-    _timer = Timer.periodic(const Duration(seconds: 5), (timer) async {
+    _timer = Timer.periodic(const Duration(seconds: 10), (timer) async {
       if (_latestImage == null) return;
+
+      // إيقاف تدفق الصور مؤقتاً
+      await _controller.stopImageStream();
 
       try {
         final imglib.Image rawImage = Converter.convertCameraImage(_latestImage!);
-        final imglib.Image resizedImage = imglib.copyResize(rawImage, width: 300);
+        final imglib.Image resizedImage = imglib.copyResize(rawImage, width: 640);
+
+        final imglib.Image adjustedImage = imglib.adjustColor(
+          resizedImage,
+          saturation: 1.2,
+          gamma: 1.0,
+        );
 
         final Uint8List jpgBytes = Uint8List.fromList(
-          imglib.encodeJpg(resizedImage, quality: 25),
+          imglib.encodeJpg(adjustedImage, quality: 85),
         );
+
+        // حفظ الصورة في المجلد داخل الذاكرة الداخلية
+        await saveImageToInternalStorage(jpgBytes, timer.tick);
 
         await sendImageData(jpgBytes);
       } catch (e) {
@@ -89,12 +139,28 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
       }
 
       _latestImage = null;
+
+      // إعادة تشغيل تدفق الصور بعد الانتهاء
+      await _controller.startImageStream((CameraImage image) {
+        _latestImage = image;
+      });
     });
+  }
+
+  Future<void> saveImageToInternalStorage(Uint8List bytes, int count) async {
+    try {
+      final file = File('${_resultsDirectory.path}/image_$count.jpg');
+      await file.writeAsBytes(bytes);
+      print("✅ تم حفظ الصورة في: ${file.path}");
+    } catch (e) {
+      print("خطأ في حفظ الصورة: $e");
+    }
+    await saveToGallery(bytes, count);
   }
 
   Future<void> sendImageData(Uint8List data) async {
     try {
-      final uri = Uri.parse('http://192.168.1.2:50001/upload');
+      final uri = Uri.parse('http://192.168.1.105:50002/upload');
       final request = http.MultipartRequest('POST', uri)
         ..files.add(http.MultipartFile.fromBytes(
           'image',
@@ -133,17 +199,15 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
     };
     final icon = icons[label.toLowerCase()] ?? Icons.help;
 
-    return FadeInUp(
-      child: Card(
-        color: Colors.grey[900],
-        margin: const EdgeInsets.symmetric(vertical: 8),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        child: ListTile(
-          leading: Icon(icon, color: Colors.white, size: 32),
-          title: Text(
-            label,
-            style: const TextStyle(color: Colors.white, fontSize: 20),
-          ),
+    return Card(
+      color: Colors.grey[900],
+      margin: const EdgeInsets.symmetric(vertical: 8),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: ListTile(
+        leading: Icon(icon, color: Colors.white, size: 32),
+        title: Text(
+          label,
+          style: const TextStyle(color: Colors.white, fontSize: 20),
         ),
       ),
     );
@@ -178,9 +242,31 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
                 style: TextStyle(color: Colors.white, fontSize: 18),
               ),
             )
-                : ListView(
-              children: _detectedObjects.map((obj) => _buildObjectItem(obj)).toList(),
+                : ListView.builder(
+              itemCount: _detectedObjects.length,
+              itemBuilder: (context, index) {
+                final label = _detectedObjects[index];
+                return AnimatedContainer(
+                  duration: const Duration(milliseconds: 500),
+                  curve: Curves.easeInOut,
+                  margin: const EdgeInsets.symmetric(vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.grey[850],
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white24),
+                  ),
+                  child: ListTile(
+                    leading: Icon(_getIcon(label), color: Colors.white, size: 32),
+                    title: Text(
+                      label,
+                      style: const TextStyle(color: Colors.white, fontSize: 20),
+                    ),
+                    trailing: const Icon(Icons.arrow_forward_ios, color: Colors.white38),
+                  ),
+                );
+              },
             ),
+
           ),
         ],
       ),
@@ -212,41 +298,29 @@ class Converter {
     final int width = cameraImage.width;
     final int height = cameraImage.height;
 
-    final imglib.Image img = imglib.Image(width: width, height: height);
-    final Uint8List yPlane = cameraImage.planes[0].bytes;
-    final Uint8List uPlane = cameraImage.planes[1].bytes;
-    final Uint8List vPlane = cameraImage.planes[2].bytes;
+    final yPlane = cameraImage.planes[0];
+    final uPlane = cameraImage.planes[1];
+    final vPlane = cameraImage.planes[2];
 
-    final int yRowStride = cameraImage.planes[0].bytesPerRow;
-    final int yPixelStride = cameraImage.planes[0].bytesPerPixel!;
+    final imglib.Image image = imglib.Image(width: width, height: height);
 
-    final int uvRowStride = cameraImage.planes[1].bytesPerRow;
-    final int uvPixelStride = cameraImage.planes[1].bytesPerPixel!;
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        final int uvIndex = ((y >> 1) * uPlane.bytesPerRow) + ((x >> 1) * uPlane.bytesPerPixel!);
+        final int yIndex = y * yPlane.bytesPerRow + x * yPlane.bytesPerPixel!;
 
-    for (int h = 0; h < height; h++) {
-      final int uvRow = h >> 1;
-      for (int w = 0; w < width; w++) {
-        final int uvCol = w >> 1;
+        final int Y = yPlane.bytes[yIndex];
+        final int U = uPlane.bytes[uvIndex];
+        final int V = vPlane.bytes[uvIndex];
 
-        final int yIndex = h * yRowStride + w * yPixelStride;
-        final int uvIndex = uvRow * uvRowStride + uvCol * uvPixelStride;
+        final int R = (Y + 1.402 * (V - 128)).round().clamp(0, 255);
+        final int G = (Y - 0.344136 * (U - 128) - 0.714136 * (V - 128)).round().clamp(0, 255);
+        final int B = (Y + 1.772 * (U - 128)).round().clamp(0, 255);
 
-        final int y = yPlane[yIndex];
-        final int u = uPlane[uvIndex];
-        final int v = vPlane[uvIndex];
-
-        int r = (y + (v * 1436 / 1024) - 179).round();
-        int g = (y - (u * 46549 / 131072) + 44 - (v * 93604 / 131072) + 91).round();
-        int b = (y + (u * 1814 / 1024) - 227).round();
-
-        r = r.clamp(0, 255);
-        g = g.clamp(0, 255);
-        b = b.clamp(0, 255);
-
-        img.setPixelRgb(w, h, r, g, b);
+        image.setPixelRgb(x, y, R, G, B);
       }
     }
 
-    return img;
+    return image;
   }
 }
