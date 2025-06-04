@@ -1,13 +1,14 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
-import 'package:flutter/material.dart' hide Image;
+import 'package:flutter/material.dart';
 import 'package:image/image.dart' as imglib;
 import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
+import 'package:flutter/services.dart';
+import 'dart:convert';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -44,63 +45,62 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
   Timer? _timer;
   List<String> _detectedObjects = [];
   late Directory _resultsDirectory;
-  IconData _getIcon(String label) {
-    final icons = {
-      'person': Icons.person,
-      'car': Icons.directions_car,
-      'dog': Icons.pets,
-      'cat': Icons.pets,
-      'chair': Icons.chair,
-      'tv': Icons.tv,
-    };
-    return icons[label.toLowerCase()] ?? Icons.help_outline;
-  }
-  Future<void> saveToGallery(Uint8List bytes, int count) async {
-    final String folderPath = "/storage/emulated/0/DCIM/DetectedImages";
-    final dir = Directory(folderPath);
-    if (!await dir.exists()) {
-      await dir.create(recursive: true);
-    }
-    final File file = File('$folderPath/image_$count.jpg');
-    await file.writeAsBytes(bytes);
-    print("✅ تم حفظ الصورة في معرض الصور: ${file.path}");
-  }
+  int _currentCameraIndex = 0;
+  bool _isProcessing = false;
+  String _serverResponse = '';
+  List<Uint8List> _processedImages = [];
 
   @override
   void initState() {
     super.initState();
-    _initializeAsyncTasks(); // دالة جديدة تقوم بالمهام غير المتزامنة
+    _initCamera();
+    _initResultsDirectory();
   }
 
-  Future<void> _initializeAsyncTasks() async {
-    await _initCamera();
-    await Permission.storage.request();
-  }
-
-
-  Future<void> _initCamera() async {
-    _controller = CameraController(
-      widget.cameras[0],
-      ResolutionPreset.max, // استخدام أعلى دقة
-      imageFormatGroup: ImageFormatGroup.yuv420,
-    );
-
-    await _controller.initialize();
-
-    if (!mounted) return;
-
-    setState(() {});
-
-    // إنشاء مجلد results في الذاكرة الداخلية
+  Future<void> _initResultsDirectory() async {
     final Directory appDir = await getApplicationDocumentsDirectory();
     _resultsDirectory = Directory('${appDir.path}/results');
-
     if (!await _resultsDirectory.exists()) {
       await _resultsDirectory.create(recursive: true);
-      print("✅ تم إنشاء مجلد النتائج: ${_resultsDirectory.path}");
     }
+  }
 
-    _startStreaming();
+  Future<void> _initCamera() async {
+    try {
+      _controller = CameraController(
+        widget.cameras[_currentCameraIndex],
+        ResolutionPreset.medium,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
+
+      await _controller.initialize();
+      await _controller.setExposureMode(ExposureMode.auto);
+      await _controller.setFocusMode(FocusMode.auto);
+
+      if (!mounted) return;
+      setState(() {});
+
+      _startStreaming();
+    } catch (e) {
+      print("Error initializing camera: $e");
+      setState(() {
+        _serverResponse = "خطأ في تهيئة الكاميرا: $e";
+      });
+    }
+  }
+
+  Future<void> _switchCamera() async {
+    if (_isProcessing) return;
+
+    _timer?.cancel();
+    await _controller.stopImageStream();
+    await _controller.dispose();
+
+    setState(() {
+      _currentCameraIndex = (_currentCameraIndex + 1) % widget.cameras.length;
+    });
+
+    await _initCamera();
   }
 
   @override
@@ -112,60 +112,73 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
 
   void _startStreaming() {
     _controller.startImageStream((CameraImage image) {
-      _latestImage = image;
-    });
-
-    _timer = Timer.periodic(const Duration(seconds: 10), (timer) async {
-      if (_latestImage == null) return;
-
-      // إيقاف تدفق الصور مؤقتاً
-      await _controller.stopImageStream();
-
-      try {
-        final imglib.Image rawImage = Converter.convertCameraImage(_latestImage!);
-        final imglib.Image resizedImage = imglib.copyResize(rawImage, width: 640);
-
-        final imglib.Image adjustedImage = imglib.adjustColor(
-          resizedImage,
-          saturation: 1.2,
-          gamma: 1.0,
-        );
-
-        final Uint8List jpgBytes = Uint8List.fromList(
-          imglib.encodeJpg(adjustedImage, quality: 85),
-        );
-
-        // حفظ الصورة في المجلد داخل الذاكرة الداخلية
-        await saveImageToInternalStorage(jpgBytes, timer.tick);
-
-        await sendImageData(jpgBytes);
-      } catch (e) {
-        print("Error processing/sending image: $e");
-      }
-
-      _latestImage = null;
-
-      // إعادة تشغيل تدفق الصور بعد الانتهاء
-      await _controller.startImageStream((CameraImage image) {
+      if (!mounted) return;
+      setState(() {
         _latestImage = image;
       });
     });
+
+    _timer = Timer.periodic(const Duration(seconds: 3), (timer) async {
+      if (_latestImage == null || _isProcessing) return;
+
+      _isProcessing = true;
+      setState(() {});
+
+      try {
+        final imglib.Image rawImage = Converter.convertCameraImage(_latestImage!);
+        final imglib.Image resizedImage = imglib.copyResize(rawImage, width: 640, height: 480);
+        final imglib.Image denoisedImage = imglib.gaussianBlur(resizedImage, radius: 1);
+        final imglib.Image adjustedImage = imglib.adjustColor(
+          denoisedImage,
+          saturation: 1.1,
+          gamma: 1.1,
+        );
+
+        final Uint8List jpgBytes = Uint8List.fromList(
+          imglib.encodeJpg(adjustedImage, quality: 90),
+        );
+
+        final response = await sendImageData(jpgBytes);
+        if (response != null && response['success']) {
+          final Uint8List processedImage = response['processed_image'];
+          setState(() {
+            _processedImages.add(processedImage);
+            _detectedObjects = response['objects'].split(', ');
+            _serverResponse = "تم التحليل بنجاح";
+          });
+
+          await _saveProcessedImage(processedImage);
+        }
+      } catch (e) {
+        print("Error processing/sending image: $e");
+        setState(() {
+          _serverResponse = "خطأ في معالجة الصورة: $e";
+        });
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isProcessing = false;
+            _latestImage = null;
+          });
+        }
+      }
+    });
   }
 
-  Future<void> saveImageToInternalStorage(Uint8List bytes, int count) async {
+  Future<void> _saveProcessedImage(Uint8List imageBytes) async {
     try {
-      final file = File('${_resultsDirectory.path}/image_$count.jpg');
-      await file.writeAsBytes(bytes);
-      print("✅ تم حفظ الصورة في: ${file.path}");
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final file = File('${_resultsDirectory.path}/processed_$timestamp.jpg');
+      await file.writeAsBytes(imageBytes);
+      print("✅ تم حفظ الصورة المحللة: ${file.path}");
     } catch (e) {
-      print("خطأ في حفظ الصورة: $e");
+      print("خطأ في حفظ الصورة المحللة: $e");
     }
-    await saveToGallery(bytes, count);
   }
 
-  Future<void> sendImageData(Uint8List data) async {
+  Future<Map<String, dynamic>?> sendImageData(Uint8List data) async {
     try {
-      final uri = Uri.parse('http://192.168.1.105:50002/upload');
+      final uri = Uri.parse('http://192.168.1.8:50002/upload');
       final request = http.MultipartRequest('POST', uri)
         ..files.add(http.MultipartFile.fromBytes(
           'image',
@@ -178,19 +191,25 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
 
       if (response.statusCode == 200) {
         final responseBody = await response.stream.bytesToString();
-        if (mounted) {
-          setState(() {
-            _detectedObjects = responseBody.split(', ').where((e) => e.isNotEmpty).toList();
-          });
-        }
+        final jsonResponse = jsonDecode(responseBody);
+        return {
+          'success': true,
+          'objects': jsonResponse['objects'],
+          'processed_image': base64Decode(jsonResponse['processed_image']),
+        };
       } else {
         print('HTTP Error: ${response.statusCode}');
+        setState(() {
+          _serverResponse = "خطأ في الخادم: ${response.statusCode}";
+        });
       }
     } catch (e) {
       print('HTTP connection error: $e');
+      setState(() {
+        _serverResponse = "خطأ في الاتصال بالخادم: $e";
+      });
     }
-
-    print("📤 Sent image of size: ${data.length} bytes via HTTP");
+    return null;
   }
 
   Widget _buildObjectItem(String label) {
@@ -201,6 +220,10 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
       'cat': Icons.pets,
       'chair': Icons.chair,
       'tv': Icons.tv,
+      'book': Icons.book,
+      'bottle': Icons.water_drop,
+      'cell phone': Icons.phone,
+      'laptop': Icons.laptop,
     };
     final icon = icons[label.toLowerCase()] ?? Icons.help;
 
@@ -214,6 +237,15 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
           label,
           style: const TextStyle(color: Colors.white, fontSize: 20),
         ),
+        trailing: IconButton(
+          icon: const Icon(Icons.copy, color: Colors.white),
+          onPressed: () {
+            Clipboard.setData(ClipboardData(text: label));
+            ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("تم نسخ النص"))
+            );
+          },
+        ),
       ),
     );
   }
@@ -221,7 +253,18 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
   @override
   Widget build(BuildContext context) {
     if (!_controller.value.isInitialized) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return Scaffold(
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CircularProgressIndicator(),
+              const SizedBox(height: 20),
+              Text(_serverResponse, style: const TextStyle(color: Colors.red)),
+            ],
+          ),
+        ),
+      );
     }
     return Scaffold(
       appBar: AppBar(
@@ -231,49 +274,84 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
         ),
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.switch_camera),
+            onPressed: _switchCamera,
+          ),
+          IconButton(
+            icon: const Icon(Icons.photo_library),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => GalleryPage(images: _processedImages)),
+              );
+            },
+          ),
+        ],
       ),
       body: Column(
         children: [
           Expanded(child: CameraPreview(_controller)),
           Container(
             width: double.infinity,
-            height: 400,
+            height: 350,
             color: Colors.black,
             padding: const EdgeInsets.all(16),
-            child: _detectedObjects.isEmpty
-                ? const Center(
-              child: Text(
-                "لا يوجد كائنات معروفة",
-                style: TextStyle(color: Colors.white, fontSize: 18),
+            child: _isProcessing
+                ? const Center(child: CircularProgressIndicator(color: Colors.white))
+                : _detectedObjects.isEmpty
+                ? Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Text("لا يوجد كائنات معروفة", style: TextStyle(color: Colors.white, fontSize: 18)),
+                  const SizedBox(height: 10),
+                  Text(_serverResponse, style: const TextStyle(color: Colors.white54)),
+                ],
               ),
             )
-                : ListView.builder(
-              itemCount: _detectedObjects.length,
-              itemBuilder: (context, index) {
-                final label = _detectedObjects[index];
-                return AnimatedContainer(
-                  duration: const Duration(milliseconds: 500),
-                  curve: Curves.easeInOut,
-                  margin: const EdgeInsets.symmetric(vertical: 8),
-                  decoration: BoxDecoration(
-                    color: Colors.grey[850],
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: Colors.white24),
-                  ),
-                  child: ListTile(
-                    leading: Icon(_getIcon(label), color: Colors.white, size: 32),
-                    title: Text(
-                      label,
-                      style: const TextStyle(color: Colors.white, fontSize: 20),
-                    ),
-                    trailing: const Icon(Icons.arrow_forward_ios, color: Colors.white38),
-                  ),
-                );
-              },
+                : ListView(
+              children: [
+                ..._detectedObjects.map((obj) => _buildObjectItem(obj)),
+                Padding(
+                  padding: const EdgeInsets.only(top: 8.0),
+                  child: Text(_serverResponse, style: const TextStyle(color: Colors.white54)),
+                ),
+              ],
             ),
-
           ),
         ],
+      ),
+    );
+  }
+}
+
+class GalleryPage extends StatelessWidget {
+  final List<Uint8List> images;
+
+  const GalleryPage({super.key, required this.images});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("الصور المحفوظة"),
+        backgroundColor: Colors.black,
+      ),
+      body: images.isEmpty
+          ? const Center(child: Text("لا توجد صور محفوظة"))
+          : GridView.builder(
+        padding: const EdgeInsets.all(8),
+        itemCount: images.length,
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 3,
+          crossAxisSpacing: 4,
+          mainAxisSpacing: 4,
+        ),
+        itemBuilder: (context, index) {
+          return Image.memory(images[index], fit: BoxFit.cover);
+        },
       ),
     );
   }
@@ -310,17 +388,19 @@ class Converter {
     final imglib.Image image = imglib.Image(width: width, height: height);
 
     for (int y = 0; y < height; y++) {
+      final int yRow = y * yPlane.bytesPerRow;
+
       for (int x = 0; x < width; x++) {
-        final int uvIndex = ((y >> 1) * uPlane.bytesPerRow) + ((x >> 1) * uPlane.bytesPerPixel!);
-        final int yIndex = y * yPlane.bytesPerRow + x * yPlane.bytesPerPixel!;
+        final int uvIndex = ((y ~/ 2) * uPlane.bytesPerRow) + ((x ~/ 2) * uPlane.bytesPerPixel!);
+        final int yIndex = yRow + x * yPlane.bytesPerPixel!;
 
         final int Y = yPlane.bytes[yIndex];
-        final int U = uPlane.bytes[uvIndex];
-        final int V = vPlane.bytes[uvIndex];
+        final int U = uPlane.bytes[uvIndex] - 128;
+        final int V = vPlane.bytes[uvIndex] - 128;
 
-        final int R = (Y + 1.402 * (V - 128)).round().clamp(0, 255);
-        final int G = (Y - 0.344136 * (U - 128) - 0.714136 * (V - 128)).round().clamp(0, 255);
-        final int B = (Y + 1.772 * (U - 128)).round().clamp(0, 255);
+        final int R = (Y + 1.370705 * V).clamp(0, 255).toInt();
+        final int G = (Y - 0.337633 * U - 0.698001 * V).clamp(0, 255).toInt();
+        final int B = (Y + 1.732446 * U).clamp(0, 255).toInt();
 
         image.setPixelRgb(x, y, R, G, B);
       }
