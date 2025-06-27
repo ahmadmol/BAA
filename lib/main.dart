@@ -9,6 +9,7 @@ import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 import 'package:flutter/services.dart';
 import 'dart:convert';
+import 'package:flutter_tts/flutter_tts.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -50,11 +51,33 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
   String _serverResponse = '';
   List<Uint8List> _processedImages = [];
 
+  final FlutterTts _flutterTts = FlutterTts();
+
   @override
   void initState() {
     super.initState();
     _initCamera();
     _initResultsDirectory();
+    _initTTS();
+  }
+
+  Future<void> _initTTS() async {
+    await _flutterTts.setLanguage("en-US");
+    await _flutterTts.setSpeechRate(0.45);
+    await _flutterTts.setPitch(1.0);
+
+    List<dynamic> voices = await _flutterTts.getVoices;
+    for (var voice in voices) {
+      final name = (voice['name'] ?? '').toLowerCase();
+      final locale = (voice['locale'] ?? '').toLowerCase();
+      if (locale.contains('en') && name.contains('google')) {
+        await _flutterTts.setVoice({
+          'name': voice['name'],
+          'locale': voice['locale'],
+        });
+        return;
+      }
+    }
   }
 
   Future<void> _initResultsDirectory() async {
@@ -82,9 +105,8 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
 
       _startStreaming();
     } catch (e) {
-      print("Error initializing camera: $e");
       setState(() {
-        _serverResponse = "خطأ في تهيئة الكاميرا: $e";
+        _serverResponse = "Camera initialization error: $e";
       });
     }
   }
@@ -107,6 +129,7 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
   void dispose() {
     _timer?.cancel();
     _controller.dispose();
+    _flutterTts.stop();
     super.dispose();
   }
 
@@ -122,7 +145,6 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
       if (_latestImage == null || _isProcessing) return;
 
       _isProcessing = true;
-      setState(() {});
 
       try {
         final imglib.Image rawImage = Converter.convertCameraImage(_latestImage!);
@@ -141,19 +163,14 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
         final response = await sendImageData(jpgBytes);
         if (response != null && response['success']) {
           final Uint8List processedImage = response['processed_image'];
-          setState(() {
-            _processedImages.add(processedImage);
-            _detectedObjects = response['objects'].split(', ');
-            _serverResponse = "تم التحليل بنجاح";
-          });
+          _processedImages.add(processedImage);
+          _detectedObjects = response['objects'].split(', ');
 
+          await _flutterTts.speak(response['objects']);
           await _saveProcessedImage(processedImage);
         }
       } catch (e) {
-        print("Error processing/sending image: $e");
-        setState(() {
-          _serverResponse = "خطأ في معالجة الصورة: $e";
-        });
+        _serverResponse = "Image processing error: $e";
       } finally {
         if (mounted) {
           setState(() {
@@ -170,15 +187,14 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
       final timestamp = DateTime.now().millisecondsSinceEpoch;
       final file = File('${_resultsDirectory.path}/processed_$timestamp.jpg');
       await file.writeAsBytes(imageBytes);
-      print("✅ تم حفظ الصورة المحللة: ${file.path}");
     } catch (e) {
-      print("خطأ في حفظ الصورة المحللة: $e");
+      print("Error saving processed image: $e");
     }
   }
 
   Future<Map<String, dynamic>?> sendImageData(Uint8List data) async {
     try {
-      final uri = Uri.parse('http://192.168.1.8:50002/upload');
+      final uri = Uri.parse('http://192.168.1.105:5050/upload');
       final request = http.MultipartRequest('POST', uri)
         ..files.add(http.MultipartFile.fromBytes(
           'image',
@@ -198,161 +214,21 @@ class _CameraStreamPageState extends State<CameraStreamPage> {
           'processed_image': base64Decode(jsonResponse['processed_image']),
         };
       } else {
-        print('HTTP Error: ${response.statusCode}');
-        setState(() {
-          _serverResponse = "خطأ في الخادم: ${response.statusCode}";
-        });
+        _serverResponse = "Server error: ${response.statusCode}";
       }
     } catch (e) {
-      print('HTTP connection error: $e');
-      setState(() {
-        _serverResponse = "خطأ في الاتصال بالخادم: $e";
-      });
+      _serverResponse = "Connection error: $e";
     }
     return null;
-  }
-
-  Widget _buildObjectItem(String label) {
-    final Map<String, IconData> icons = {
-      'person': Icons.person,
-      'car': Icons.directions_car,
-      'dog': Icons.pets,
-      'cat': Icons.pets,
-      'chair': Icons.chair,
-      'tv': Icons.tv,
-      'book': Icons.book,
-      'bottle': Icons.water_drop,
-      'cell phone': Icons.phone,
-      'laptop': Icons.laptop,
-    };
-    final icon = icons[label.toLowerCase()] ?? Icons.help;
-
-    return Card(
-      color: Colors.grey[900],
-      margin: const EdgeInsets.symmetric(vertical: 8),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: ListTile(
-        leading: Icon(icon, color: Colors.white, size: 32),
-        title: Text(
-          label,
-          style: const TextStyle(color: Colors.white, fontSize: 20),
-        ),
-        trailing: IconButton(
-          icon: const Icon(Icons.copy, color: Colors.white),
-          onPressed: () {
-            Clipboard.setData(ClipboardData(text: label));
-            ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text("تم نسخ النص"))
-            );
-          },
-        ),
-      ),
-    );
   }
 
   @override
   Widget build(BuildContext context) {
     if (!_controller.value.isInitialized) {
-      return Scaffold(
-        body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const CircularProgressIndicator(),
-              const SizedBox(height: 20),
-              Text(_serverResponse, style: const TextStyle(color: Colors.red)),
-            ],
-          ),
-        ),
-      );
+      return const Scaffold(body: SizedBox.expand());
     }
     return Scaffold(
-      appBar: AppBar(
-        title: const Align(
-          alignment: Alignment.centerRight,
-          child: Text("مساعد ذكي للمكفوفين", style: TextStyle(color: Colors.white)),
-        ),
-        backgroundColor: Colors.black,
-        foregroundColor: Colors.white,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.switch_camera),
-            onPressed: _switchCamera,
-          ),
-          IconButton(
-            icon: const Icon(Icons.photo_library),
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => GalleryPage(images: _processedImages)),
-              );
-            },
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Expanded(child: CameraPreview(_controller)),
-          Container(
-            width: double.infinity,
-            height: 350,
-            color: Colors.black,
-            padding: const EdgeInsets.all(16),
-            child: _isProcessing
-                ? const Center(child: CircularProgressIndicator(color: Colors.white))
-                : _detectedObjects.isEmpty
-                ? Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Text("لا يوجد كائنات معروفة", style: TextStyle(color: Colors.white, fontSize: 18)),
-                  const SizedBox(height: 10),
-                  Text(_serverResponse, style: const TextStyle(color: Colors.white54)),
-                ],
-              ),
-            )
-                : ListView(
-              children: [
-                ..._detectedObjects.map((obj) => _buildObjectItem(obj)),
-                Padding(
-                  padding: const EdgeInsets.only(top: 8.0),
-                  child: Text(_serverResponse, style: const TextStyle(color: Colors.white54)),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class GalleryPage extends StatelessWidget {
-  final List<Uint8List> images;
-
-  const GalleryPage({super.key, required this.images});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text("الصور المحفوظة"),
-        backgroundColor: Colors.black,
-      ),
-      body: images.isEmpty
-          ? const Center(child: Text("لا توجد صور محفوظة"))
-          : GridView.builder(
-        padding: const EdgeInsets.all(8),
-        itemCount: images.length,
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 3,
-          crossAxisSpacing: 4,
-          mainAxisSpacing: 4,
-        ),
-        itemBuilder: (context, index) {
-          return Image.memory(images[index], fit: BoxFit.cover);
-        },
-      ),
+      body: CameraPreview(_controller),
     );
   }
 }
